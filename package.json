@@ -21,6 +21,7 @@
     "dev": "bun --watch run src/index.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "measure": "bun run scripts/analyze-events.ts"
+    "measure": "bun run scripts/analyze-events.ts",
+    "pull-events": "bun run scripts/pull-events.ts"
   }
 }

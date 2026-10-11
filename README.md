@@ -18,6 +18,7 @@ Deployed (dry run, mock model): https://jev-trader-production.up.railway.app
 - `GET /health` the guards alone: `paused`, `lastBlockTs`, `ageMs`, `stale`, inflight, unknown orphans, gas
 - `GET /history` last 1000 block events
 - `GET /events` SSE: `snapshot` on connect, then one `block` event per block, plus a `fill` event whenever a live order's receipt lands
+- `GET /export/events?part=current|previous` downloads `events.jsonl` or its one rotated predecessor; requires `Authorization: Bearer …` and returns 404 unless `EVENT_EXPORT_TOKEN` is configured
 
 `health.stale` and `health.paused` are how "running" is told from "wedged": the transport can be up
 (`ping` every 15 s) while no block is being decided, and the dashboard shows that as `stalled` instead
@@ -80,7 +81,20 @@ The report includes maker-side fill mark-outs at +1, +5 and +20 blocks, fill-tim
 
 The report splits live, simulated and unclassified fills. Simulated fills are counterfactual because the dry-run matcher does not reconstruct queue priority or displacement; do not treat them as realized executions. Gas totals use receipt-derived costs when available, fall back to the send estimate when unresolved, and label dry-run gas as simulated. The fill-time comparison is an immediate midpoint capture, not closed-trade P&L. A mark-out is `sign × (futureMid - fillPrice)`, with `sign=+1` for our buy and `-1` for our sell, then multiplied by fill size. Negative mark-out is adverse selection for the maker. IC samples overlap and are descriptive, not proof of a profitable edge.
 
-Block snapshots are kept in their existing JSONL format. New runs also append typed `fill` records for every raw fill and typed `quote` records when receipts resolve, because fills and receipts arrive after the block snapshot was written. Older logs written before this instrumentation may have no durable fill records; a reported zero then means "not recorded", not necessarily "no fills". Rotation keeps only `events.jsonl` and `events.jsonl.1`, so save/copy logs elsewhere if you need a longer study.
+Block snapshots are kept in their existing JSONL format. New runs also append typed `fill` records for every raw fill and typed `quote` records when receipts resolve, because fills and receipts arrive after the block snapshot was written. Older logs written before this instrumentation may have no durable fill records; a reported zero then means "not recorded", not necessarily "no fills". Server-side rotation deliberately remains bounded to `events.jsonl` and `events.jsonl.1`.
+
+### Export and retain logs for local analysis
+
+Set a strong `EVENT_EXPORT_TOKEN` in the service's deployment secrets. The authenticated export route stays disabled (404) while it is unset; the token is sent in the `Authorization` header, never in the URL. From a trusted local machine, make the same secret available as an environment variable and pull periodically (about every 30 minutes is a good starting interval):
+
+    bun run pull-events -- --url https://your-service.example --out ./data
+
+The puller fetches the current and rotated files, ignores an incomplete trailing JSONL line, and appends only unseen records to `./data/events-archive.jsonl`. Re-running is idempotent, so the local archive can outlive the server's bounded two-file rotation. Keep the token out of source control and use HTTPS outside local testing. Analyze the accumulated archive with:
+
+    bun run measure -- --input ./data/events-archive.jsonl
+    bun run measure -- --input ./data/events-archive.jsonl --json
+
+No real service logs are included with the repository; conclusions require pulling the actual logs first.
 
 ## Layout
 
@@ -91,8 +105,10 @@ Block snapshots are kept in their existing JSONL format. New runs also append ty
     src/model.ts    Model interface, JevModel (AI SDK experimental_evaluate), MockModel
     src/trader.ts   the loop: one in flight, hold when late, guards, position and P&L accounting
     src/measure.ts  offline event-log metrics: fills, mark-outs, gas and model IC
-    src/server.ts   Bun.serve: snapshot, health, history, SSE
+    src/event-export.ts authenticated, bounded export of the two server-side log files
+    src/server.ts   Bun.serve: snapshot, health, history, SSE and event export
     scripts/analyze-events.ts  command-line event-log report
+    scripts/pull-events.ts     idempotent local JSONL archive puller
     src/robustness.test.ts  deadline, gas limit, log decoders, pause transitions
     src/measurement.test.ts  event-log and measurement formulas
 

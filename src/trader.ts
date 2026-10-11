@@ -101,6 +101,7 @@ export class Trader {
   private lastBlock = 0;
   private lastBlockTs = 0;
   private logBytes = 0;
+  private fillSequence = 0;
 
   constructor(
     private market: Market,
@@ -315,7 +316,8 @@ export class Trader {
       // Persist each raw fill, not only the block-level UI aggregate. Two sides or multiple
       // partial fills can land in the same block and must all contribute to mark-outs.
       const { block: _block, ...fill } = f as Fill & { block: number };
-      this.appendJournal("fill", b, { fill });
+      // Sequence prevents exact duplicate hashes when identical simulated fills share a timestamp.
+      this.appendJournal("fill", b, { fill, sequence: ++this.fillSequence });
       byBlock.set(b, [...(byBlock.get(b) ?? []), f]);
     }
     for (const [block, fs] of byBlock) {

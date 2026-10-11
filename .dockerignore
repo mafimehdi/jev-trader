@@ -3,4 +3,5 @@ node_modules
 data
 scripts/*
 !scripts/analyze-events.ts
+!scripts/pull-events.ts
 .claude

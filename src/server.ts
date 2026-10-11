@@ -1,10 +1,11 @@
 import { config } from "./config";
 import type { Fill, Quote } from "./market";
 import type { BlockEvent, Health } from "./trader";
+import { eventLogResponse } from "./event-export";
 
 interface Meta { model: string; wallet: string | null; dryRun: boolean; market: string; startedAt: number }
 
-const CORS = { "access-control-allow-origin": "*", "access-control-allow-headers": "*" };
+const CORS = { "access-control-allow-origin": "*", "access-control-allow-headers": "authorization, content-type", "access-control-allow-methods": "GET, OPTIONS" };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...CORS, "content-type": "application/json" } });
 
 /**
@@ -30,6 +31,7 @@ export function startServer(meta: Meta, history: () => BlockEvent[], health: () 
       if (pathname === "/") return json({ ...meta, health: health(), latest: history().at(-1) ?? null });
       if (pathname === "/health") return json(health());
       if (pathname === "/history") return json(history());
+      if (pathname === "/export/events") return eventLogResponse(req, config.eventExportToken);
       if (pathname === "/events") {
         const stream = new ReadableStream<Uint8Array>({
           start(c) { clients.add(c); send(c, "snapshot", { ...meta, health: health(), history: history() }); },

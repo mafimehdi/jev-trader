@@ -40,6 +40,8 @@ export const config = {
   staleMs: Number(env("STALE_MS", "5000")),
   /** Rotate data/events.jsonl once past this size (bytes). It grows ~4 KB per block. 0 = never. */
   eventLogMaxBytes: Number(env("EVENT_LOG_MAX_BYTES", String(64 * 1024 * 1024))),
+  /** Optional bearer secret for downloading event logs. Unset disables the export route. */
+  eventExportToken: env("EVENT_EXPORT_TOKEN"),
   horizonBlocks: Number(env("HORIZON_BLOCKS", "100")), // the model is asked about the move over this many blocks (~30 s)
   model: env("MODEL", "mock") as "mock" | "jev",
   jevModelId: env("JEV_MODEL_ID", "jev-latest")!,

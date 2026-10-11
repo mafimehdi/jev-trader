@@ -30,7 +30,7 @@
 | ۳ هدر رفتن گس limit | ✅ اندازه‌گیری per shape از رسیدها + ۴۵k به‌ازای هر کنسل اضافه، x1.15، کف = برآورد startup | `src/market.ts` (`tightLimit`) |
 | ۴ حلقه revert | ✅ `REVERT_LIMIT=3` ⇒ `paused: "reverts"` + یک پروب هر ۴۰۰ بلاک | `src/trader.ts` (`applyQuoteResult`, `quoteGate`) |
 | ۵ nonce گیرکرده | ✅ `PENDING_STUCK_BLOCKS=10` ⇒ `paused: "stuck nonce"`؛ hash پس از هشدار همچنان poll می‌شود و ارسال تازه تا receipt متوقف است | `src/trader.ts`, `src/market.ts` (`pendingAge`) |
-| ۶ رشد فایل لاگ | ✅ چرخش `data/events.jsonl` در `EVENT_LOG_MAX_BYTES` (پیش‌فرض ۶۴MB) | `src/trader.ts` |
+| ۶ رشد فایل لاگ | ✅ چرخش `data/events.jsonl` در `EVENT_LOG_MAX_BYTES` (پیش‌فرض ۶۴MB)؛ export احراز هویت‌شده و آرشیو pull محلی به‌جای نگه‌داری نامحدود روی سرور | `src/trader.ts`, `src/event-export.ts`, `scripts/pull-events.ts` |
 | ۸ گس صفر در شبیه‌سازی | ✅ در dry-run هم `gasMon` واقعی شارژ می‌شود (۰.۰۳۵۷ MON برای limit پیش‌فرض) | `src/market.ts`, `src/trader.ts` |
 | ۱۳ نبود بودجه/kill-switch | ✅ `GAS_BUDGET_MON` (فقط live) ⇒ `paused: "gas budget"` (نهایی) | `src/trader.ts` |
 | کوری UI به رکود | ✅ `health` در `/`، `/health` و snapshot استریم؛ `useStalled` در کلاینت؛ هدر «stalled» و پنل تصمیم «PAUSED (reason)» | `src/server.ts`, `web/src/lib/useFeed.ts`, هدر/استتس/پنل |
@@ -47,6 +47,12 @@
 یک نقص داده‌ای هم لازم بود بسته شود: snapshot بلاک پیش از رسیدن فید fill روی دیسک نوشته می‌شد و بعداً فقط در حافظه اصلاح می‌شد. از این نسخه، هر fill خام به‌صورت رکورد `type: "fill"` و نتیجه‌ی نهایی receipt به‌صورت `type: "quote"` در JSONL ثبت می‌شود؛ تحلیلگر هر دو قالب قدیمی و جدید را می‌خواند. بنابراین در لاگ‌های قدیمی، صفر بودن fill ممکن است «ثبت نشده» باشد، نه «رخ نداده».
 
 عدد کهنه‌ی هزینه‌ی گس در `SPEC.md` نیز با برآورد فعلی (حدود ۴۲۸ MON یا ۱۱ دلار در ساعت با قیمت مفروض MON) جایگزین شد. در checkout فعلی فایل داده‌ی `data/events.jsonl` وجود ندارد و پوشه‌ی `data/` هم عمداً در Git نادیده گرفته می‌شود؛ پس هنوز هیچ نتیجه‌ی mark-out یا IC برای ارائه ندارم و عددی جعل نمی‌کنم. قدم ۵ (حالت استراتژی واقعی) انجام نشده است. ابتدا باید این نسخه اجرا شود و نمونه‌ی کافی از fill و تصمیم ثبت کند؛ سپس نتیجه‌ی هزینه پس از گس و انتخاب معکوس مبنای ادامه یا توقف باشد. IC خام با بازده‌های هم‌پوشان، به‌تنهایی اثبات لبه نیست.
+
+## به‌روزرسانی: خروجی امن و نگه‌داری محلی لاگ
+
+به‌جای افزایش نامحدود نگه‌داری روی سرور، `GET /export/events?part=current|previous` فقط با `Authorization: Bearer …` کار می‌کند و اگر `EVENT_EXPORT_TOKEN` تنظیم نشده باشد 404 می‌دهد. `bun run pull-events -- --url … --out ./data` دو فایل چرخشی را می‌گیرد و رکوردهای کامل JSONL را با SHA-256 از موارد قبلاً ذخیره‌شده جدا می‌کند؛ تکرار pull، `data/events-archive.jsonl` را دوباره‌نویسی یا دوبرابر نمی‌کند. پیشنهاد: هر ۳۰ دقیقه pull و سپس تحلیل فایل آرشیو محلی. توکن باید فقط در secret محیط سرویس و محیط محلی باشد، نه در Git یا URL.
+
+اعتبارسنجی این گام: ۳۰ تست پاس، ۰ شکست، ۱۰۷ assertion؛ typecheck backend و typecheck مستقل اسکریپت‌های CLI نیز موفق‌اند. این قابلیت داده‌ی واقعی تولید نمی‌کند: در workspace هنوز لاگ سرویس موجود نیست و هیچ نتیجه‌ی edge/mark-out تازه‌ای ادعا نمی‌شود. قدم ۵ همچنان متوقف است تا لاگ واقعی جمع و تحلیل شود.
 
 ## ۱) استراتژی دقیقاً چه می‌کند
 

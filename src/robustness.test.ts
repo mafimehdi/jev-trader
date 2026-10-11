@@ -243,7 +243,10 @@ describe("Trader guards", () => {
       recent: () => [],
       drainOwn: () => ({ created: [], canceled: [] }),
       drainPrints: () => [],
-      drainFills: () => [{ block: 1, txHash: "0xtaker", orderId: 42, price: 0.0258, size: 2, updatedSize: 0, side: "buy" }],
+      drainFills: () => [
+        { block: 1, txHash: "0xtaker", orderId: 42, price: 0.0258, size: 2, updatedSize: 0, side: "buy" },
+        { block: 1, txHash: "0xtaker", orderId: 42, price: 0.0258, size: 2, updatedSize: 0, side: "buy" },
+      ],
     };
 
     await trader.onBlock(1);
@@ -254,7 +257,9 @@ describe("Trader guards", () => {
       canceled: [],
     });
     const records = readFileSync("data/events.jsonl", "utf8").trim().split("\n").map((line) => JSON.parse(line));
-    expect(records.some((record) => record.type === "fill" && record.block === 1 && record.fill.orderId === 42)).toBe(true);
+    const fillRecords = records.filter((record) => record.type === "fill" && record.block === 1 && record.fill.orderId === 42);
+    expect(fillRecords).toHaveLength(2);
+    expect(fillRecords.map((record) => record.sequence)).toEqual([1, 2]);
     expect(records.some((record) => record.type === "quote" && record.block === 1 && record.quote.status === "placed")).toBe(true);
   });
 });
