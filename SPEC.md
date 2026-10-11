@@ -12,7 +12,7 @@ A single-page web app. A TypeSafe "Jev" model (a System One model: no text outpu
 
 ## The message
 Primary: "This AI makes a real trade decision every 300 ms on Monad."
-Secondary punchline: "The AI costs less than the gas." (Jev inference for an hour ≈ $0.20; gas for the same hour ≈ $2–5.)
+Secondary punchline: "The AI costs less than the gas." (Jev inference for an hour ≈ $0.20; baseline gas at the default limit is about 428 MON/hour, or ≈ $11/hour at MON = $0.0258. Dollar cost varies with MON price, gas limit and fee.)
 Nothing on screen may compete with these two lines.
 
 ## Design principles

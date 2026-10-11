@@ -77,7 +77,7 @@ export function tightLimit(used: Map<number, number>, cancelCount: number, fallb
   return Math.max(Math.ceil((used.get(nearest)! + 45_000 * Math.max(0, cancelCount - nearest)) * 1.15), floor);
 }
 
-interface Pending { block: number; quote: Quote; gasLimit: ethers.BigNumber }
+interface Pending { block: number; quote: Quote; gasLimit: ethers.BigNumber; lostReported: boolean }
 
 /** Kuru MON-USDC market: read the book, post one limit order per block, confirm asynchronously. */
 export class Market {
@@ -171,7 +171,7 @@ export class Market {
       throw e;
     }
     const quote: Quote = { side, price, size: sizeMon, txHash: hash, gasMon: this.gasMon(this.gasLimit, this.feeWei), cancel, status: "sent", orderId: null, capped };
-    this.pending.set(hash, { block, quote, gasLimit: this.gasLimit });
+    this.pending.set(hash, { block, quote, gasLimit: this.gasLimit, lostReported: false });
     return quote;
   }
 
@@ -199,11 +199,13 @@ export class Market {
       if (receipt) {
         this.pending.delete(hash);
         out.push(this.parseReceipt(receipt, p));
-      } else if (block - p.block >= config.pendingBlocks) {
-        this.pending.delete(hash);
+      } else if (block - p.block >= config.pendingBlocks && !p.lostReported) {
+        // Report the missing receipt once, but keep tracking the hash. It may still land later; the
+        // trader pauses new sends at PENDING_STUCK_BLOCKS until this receipt resolves.
+        p.lostReported = true;
         lost = true;
-        // Keep the gas this send was quoted at: the tx either never landed (a small over-report) or
-        // landed without a receipt we ever saw (real spend). Under-reporting spend is the worse error.
+        // Keep the gas this send was quoted at: it either never landed (a small over-report) or
+        // landed without a receipt we have seen yet (real spend). Under-reporting is the worse error.
         out.push({ block: p.block, quote: { ...p.quote, status: "lost" }, canceled: [] });
       }
     }));

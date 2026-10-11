@@ -57,16 +57,30 @@ than a silent stall. `paused` is echoed on each block event and in `health`:
 
 | `paused` | When | Back |
 |---|---|---|
-| `model` | `MODEL_FAILURE_LIMIT` model calls in a row failed (a call past `MODEL_TIMEOUT_MS` counts as late, not as a failure) | by itself, on the next answered decision |
+| `model` | `MODEL_FAILURE_LIMIT` model calls in a row failed; a timeout emits a late block and counts as a failure | by itself, on the next answered decision |
 | `reverts` | `REVERT_LIMIT` consecutive reverted or lost quotes | one probe tx every `PROBE_BLOCKS`, until a quote lands |
-| `stuck nonce` | an unconfirmed tx older than `PENDING_STUCK_BLOCKS` | when the pending txs confirm |
+| `stuck nonce` | a receipt is still missing after `PENDING_STUCK_BLOCKS`; the hash remains tracked | when the pending txs resolve |
 | `gas budget` | live only; cumulative gas past `GAS_BUDGET_MON` | never, it is a hard stop |
 
 Two more counters in `health`: `inflight` (sends without a receipt) and `unknownOrphans` (lost
 receipts whose order id never surfaced; the log feed adopts such an order the moment it appears, and
 the count drops). `data/events.jsonl` rotates past `EVENT_LOG_MAX_BYTES`.
 
-`bun test` covers the deadline, the gas-limit maths, the log decoders and the pause transitions.
+`bun test` covers the deadline, the gas-limit maths, the log decoders, pause transitions and the measurement formulas.
+
+## Offline measurement
+
+Run the analysis locally against the event log. It reads both the current file and its one rotated predecessor when present:
+
+    bun run measure
+    bun run scripts/analyze-events.ts --input ./data --horizon 100 --max-gap 2
+    bun run scripts/analyze-events.ts --input ./data --json
+
+The report includes maker-side fill mark-outs at +1, +5 and +20 blocks, fill-time price versus the recorded midpoint, quote attempts and confirmed placements, gas per fill, and Pearson/Spearman information coefficients between `probabilities.buy` and the forward midpoint return. The model horizon defaults to 100 blocks. A forward sample uses the first recorded midpoint at or after the target block, only if it is within `--max-gap` (default 2 blocks). Late events that reuse a previous book read are excluded as midpoint samples.
+
+The report splits live, simulated and unclassified fills. Simulated fills are counterfactual because the dry-run matcher does not reconstruct queue priority or displacement; do not treat them as realized executions. Gas totals use receipt-derived costs when available, fall back to the send estimate when unresolved, and label dry-run gas as simulated. The fill-time comparison is an immediate midpoint capture, not closed-trade P&L. A mark-out is `sign × (futureMid - fillPrice)`, with `sign=+1` for our buy and `-1` for our sell, then multiplied by fill size. Negative mark-out is adverse selection for the maker. IC samples overlap and are descriptive, not proof of a profitable edge.
+
+Block snapshots are kept in their existing JSONL format. New runs also append typed `fill` records for every raw fill and typed `quote` records when receipts resolve, because fills and receipts arrive after the block snapshot was written. Older logs written before this instrumentation may have no durable fill records; a reported zero then means "not recorded", not necessarily "no fills". Rotation keeps only `events.jsonl` and `events.jsonl.1`, so save/copy logs elsewhere if you need a longer study.
 
 ## Layout
 
@@ -76,8 +90,11 @@ the count drops). `data/events.jsonl` rotates past `EVENT_LOG_MAX_BYTES`.
     src/market.ts   Kuru: read book, hand-encoded batchUpdate (cancel + post-only place), margin deposits, local nonce, async confirmation
     src/model.ts    Model interface, JevModel (AI SDK experimental_evaluate), MockModel
     src/trader.ts   the loop: one in flight, hold when late, guards, position and P&L accounting
+    src/measure.ts  offline event-log metrics: fills, mark-outs, gas and model IC
     src/server.ts   Bun.serve: snapshot, health, history, SSE
+    scripts/analyze-events.ts  command-line event-log report
     src/robustness.test.ts  deadline, gas limit, log decoders, pause transitions
+    src/measurement.test.ts  event-log and measurement formulas
 
 ## The 300 ms budget
 

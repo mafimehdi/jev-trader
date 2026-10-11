@@ -1,4 +1,4 @@
-/** Formatting helpers — see CONTRACT.md. All are pure and SSR-safe. */
+/** Formatting helpers: see CONTRACT.md. All are pure and SSR-safe. */
 
 const INT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 

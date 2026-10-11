@@ -97,6 +97,7 @@ export class Trader {
   private reverts = 0; // consecutive reverted/lost quotes
   private probeAt = 0; // while paused by reverts, the next block a probe send is allowed
   private unknownOrphans = 0; // lost receipts whose order id never surfaced
+  private unknownReceiptHashes = new Set<string>();
   private lastBlock = 0;
   private lastBlockTs = 0;
   private logBytes = 0;
@@ -209,15 +210,15 @@ export class Trader {
       }
       return "gas budget";
     }
-    if (this.paused === "reverts") return block >= this.probeAt ? null : "reverts";
     const pendingAge = this.market.pendingAge(block);
     if (pendingAge >= config.pendingStuckBlocks) {
       if (this.paused !== "stuck nonce") {
         this.paused = "stuck nonce";
-        console.warn(`block ${block}: oldest unconfirmed tx is ${pendingAge} blocks old (stuck nonce?); quoting paused`);
+        console.warn(`block ${block}: oldest unconfirmed tx is ${pendingAge} blocks old; quoting paused until receipts resolve`);
       }
       return "stuck nonce";
     }
+    if (this.paused === "reverts") return block >= this.probeAt ? null : "reverts";
     if (this.paused === "stuck nonce") { this.paused = null; console.log(`block ${block}: pending txs confirmed, quoting resumed`); }
     return this.paused;
   }
@@ -252,6 +253,9 @@ export class Trader {
     if (quote.txHash) this.inflight.delete(quote.txHash);
     this.totals.gasMon += quote.gasMon; // charged on reverts too
     for (const id of canceled) this.orders.delete(id);
+    if (quote.txHash && quote.status !== "lost" && this.unknownReceiptHashes.delete(quote.txHash)) {
+      this.unknownOrphans = Math.max(0, this.unknownOrphans - 1);
+    }
 
     // Breaker: a run of reverted or lost quotes is not bad luck, it is the market telling us not to
     // send. Pause and retry with a single probe tx every `probeBlocks` instead of paying every block.
@@ -260,7 +264,10 @@ export class Trader {
       if (this.paused === "reverts") { this.paused = null; console.log(`block ${block}: a quote landed again, quoting resumed`); }
     } else if (quote.status === "reverted" || quote.status === "lost") {
       if (quote.status === "reverted") this.totals.reverted++;
-      if (quote.status === "lost") this.unknownOrphans++; // the order may exist on the book; the log feed will say so
+      if (quote.status === "lost" && quote.txHash && !this.unknownReceiptHashes.has(quote.txHash)) {
+        this.unknownReceiptHashes.add(quote.txHash);
+        this.unknownOrphans++; // the order may exist on the book; the log feed will say so
+      }
       this.reverts++;
       if (this.reverts >= config.revertLimit && this.paused !== "reverts") {
         this.paused = "reverts";
@@ -271,6 +278,9 @@ export class Trader {
     if (quote.status === "placed" && quote.orderId !== null) this.orders.set(quote.orderId, { side: quote.side, price: quote.price, size: quote.size, block });
     const e = this.history.find((h) => h.block === block);
     if (e) e.quote = quote;
+    // The original block line records the send intent. This second record makes the eventual
+    // receipt outcome durable for offline placement-rate and revert analysis.
+    this.appendJournal("quote", block, { quote });
     this.onQuote(block, quote);
   }
 
@@ -287,6 +297,8 @@ export class Trader {
       if (this.orders.has(o.orderId)) continue;
       this.orders.set(o.orderId, { side: o.side, price: o.price, size: o.size, block: o.block });
       if (this.unknownOrphans > 0) {
+        const unresolvedHash = this.unknownReceiptHashes.values().next().value;
+        if (unresolvedHash !== undefined) this.unknownReceiptHashes.delete(unresolvedHash);
         this.unknownOrphans--;
         console.warn(`block ${o.block}: adopted order ${o.orderId} (${o.side} ${o.size} @ ${o.price}); its receipt never arrived`);
       }
@@ -300,6 +312,10 @@ export class Trader {
     for (const f of fills) {
       this.applyFill(f);
       const b = (f as Fill & { block: number }).block;
+      // Persist each raw fill, not only the block-level UI aggregate. Two sides or multiple
+      // partial fills can land in the same block and must all contribute to mark-outs.
+      const { block: _block, ...fill } = f as Fill & { block: number };
+      this.appendJournal("fill", b, { fill });
       byBlock.set(b, [...(byBlock.get(b) ?? []), f]);
     }
     for (const [block, fs] of byBlock) {
@@ -437,7 +453,16 @@ export class Trader {
 
   /** `data/events.jsonl` grows ~4 KB per block: rotate past the cap so a long run cannot fill the disk. */
   private appendEvent(event: BlockEvent) {
-    const line = JSON.stringify(event) + "\n";
+    this.appendRecord(event);
+  }
+
+  /** Durable lifecycle records supplement block snapshots because fills and receipts arrive later. */
+  private appendJournal(type: "fill" | "quote", block: number, data: Record<string, unknown>) {
+    this.appendRecord({ type, block, ts: Date.now(), ...data });
+  }
+
+  private appendRecord(record: unknown) {
+    const line = JSON.stringify(record) + "\n";
     if (config.eventLogMaxBytes > 0 && this.logBytes + line.length > config.eventLogMaxBytes) {
       try { renameSync("data/events.jsonl", "data/events.jsonl.1"); } catch { /* first rotation, or a locked file: start over */ }
       this.logBytes = 0;

@@ -53,7 +53,7 @@ export default function StatsRow({
       <span className={styles.nowrap}>{totals ? fmtInt(totals.decisions) : DASH} calls</span>
       <span className={styles.nowrap}>{totals ? fmtInt(totals.fills) : DASH} fills</span>
       <span className={styles.nowrap}>
-        gas {totals ? totals.gasMon.toFixed(2) : DASH} MON ({totals ? `$${totals.gasUsd.toFixed(3)}` : DASH}) ·{" "}
+        gas {totals ? totals.gasMon.toFixed(2) : DASH} MON ({totals ? `$${totals.gasUsd.toFixed(3)}` : DASH}) |{" "}
         {gasMonPerHour.toFixed(0)} MON/hr ({usdPerMon ? `$${(gasMonPerHour * usdPerMon).toFixed(2)}` : DASH})
         {health && health.gasBudgetMon > 0 ? ` / budget ${health.gasBudgetMon}` : ""}
       </span>

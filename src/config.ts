@@ -25,7 +25,7 @@ export const config = {
   // EIP-1559 type-2 only. Effective price = base + priority, so a high static cap is free.
   maxFeeGwei: Number(env("MAX_FEE_GWEI", "400")),
   priorityFeeGwei: Number(env("PRIORITY_FEE_GWEI", "2")), // Monad hardcodes eth_maxPriorityFeePerGas at 2
-  pendingBlocks: 10, // give up on a tx with no receipt after this many blocks
+  pendingBlocks: 10, // first report a missing receipt after this many blocks; keep checking until resolved
   refreshBlocks: 200, // how often to refresh the fee estimate, margin balances and the vault check
   // Guards. Nothing in the block loop may hang or burn gas unattended: every one of these ends in `paused`.
   modelTimeoutMs: Number(env("MODEL_TIMEOUT_MS", "250")), // a model call past this rejects; the block goes out late
@@ -35,7 +35,7 @@ export const config = {
   /** Live only: stop quoting once cumulative gas passes this many MON. 0 = off. A 30 minute session is ~215 MON. */
   gasBudgetMon: Number(env("GAS_BUDGET_MON", "0")),
   /** Stop sending while an unconfirmed tx is older than this many blocks (a stuck nonce). */
-  pendingStuckBlocks: Number(env("PENDING_STUCK_BLOCKS", "100")),
+  pendingStuckBlocks: Number(env("PENDING_STUCK_BLOCKS", "10")), // stop sends while any receipt remains unresolved
   /** No block for this long marks the snapshot stale, so a wedged loop cannot look live. */
   staleMs: Number(env("STALE_MS", "5000")),
   /** Rotate data/events.jsonl once past this size (bytes). It grows ~4 KB per block. 0 = never. */

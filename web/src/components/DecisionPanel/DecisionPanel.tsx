@@ -73,7 +73,7 @@ export default function DecisionPanel({ latest, paused = null }: DecisionPanelPr
   return (
     <div className={styles.panel}>
       <section className={styles.section}>
-        <div className={styles.sectionLabel}>STANDING ORDER{paused ? ` — PAUSED (${paused.toUpperCase()})` : ""}</div>
+        <div className={styles.sectionLabel}>STANDING ORDER{paused ? ` | PAUSED (${paused.toUpperCase()})` : ""}</div>
         <div className={styles.order}>
           {"> post a bid or an ask on Kuru's MON/USDC book. every block. no abstaining."}
         </div>

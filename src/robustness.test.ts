@@ -5,12 +5,12 @@
  * The trader writes `data/events.jsonl`, so these run in a temp cwd and never touch the repo's copy.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ethers } from "ethers";
 import { config } from "./config";
-import type { Book, Market } from "./market";
+import type { Book, Market, QuoteResult } from "./market";
 import { tightLimit } from "./market";
 import { ModelTimeout, withDeadline, type Decision, type Model, type TradeState } from "./model";
 import { Trader, type BlockEvent } from "./trader";
@@ -49,15 +49,17 @@ class ScriptedModel implements Model {
 }
 
 /** A Market that never touches the network: every send is a dry-run quote. */
-function fakeMarket(): Market {
+function fakeMarket(live = false, pendingAge: () => number = () => 0): Market {
   return {
-    wallet: null, address: null, margin: { mon: 600, usdc: 20 },
+    wallet: live ? { address: "0x1111111111111111111111111111111111111111" } : null,
+    address: live ? "0x1111111111111111111111111111111111111111" : null,
+    margin: { mon: 600, usdc: 20 },
     readBook: async () => BOOK,
     refresh: async () => {},
     pollPending: async () => [],
-    pendingAge: () => 0,
+    pendingAge,
     send: async (_block: number, side: "buy" | "sell", size: number, _b: Book, cancel: number[], capped: boolean) =>
-      ({ side, price: 0.0258, size, txHash: null, gasMon: 0.0357, cancel, status: "sim" as const, orderId: null, capped }),
+      ({ side, price: 0.0258, size, txHash: live ? "0xsent" : null, gasMon: 0.0357, cancel, status: live ? "sent" as const : "sim" as const, orderId: null, capped }),
   } as unknown as Market;
 }
 
@@ -78,6 +80,13 @@ describe("withDeadline", () => {
     const guarded = withDeadline(model, 100);
     expect((await guarded.decide({} as TradeState)).action).toBe("buy");
     expect(guarded.name).toBe("scripted");
+  });
+
+  test("handles a model that throws synchronously", async () => {
+    const model: Model = { name: "sync throw", decide: () => { throw new Error("sync boom"); } };
+    await expect(withDeadline(model, 20).decide({} as TradeState)).rejects.toThrow("sync boom");
+    await Bun.sleep(30);
+    expect(true).toBe(true);
   });
 
   test("a call that lands after the timeout does not escape as an unhandled rejection", async () => {
@@ -194,5 +203,58 @@ describe("Trader guards", () => {
     expect(h.stale).toBe(false);
     expect(h.lastBlock).toBe(1);
     expect(h.ageMs).toBeGreaterThanOrEqual(0);
+  });
+
+  test("pauses on an unresolved nonce and resumes only after its receipt resolves", () => {
+    const previousBudget = config.gasBudgetMon;
+    config.gasBudgetMon = 0;
+    let age = config.pendingStuckBlocks;
+    const trader = new Trader(fakeMarket(true, () => age), new ScriptedModel(), () => {});
+    const internal = trader as unknown as { quoteGate: (block: number) => string | null };
+    try {
+      expect(internal.quoteGate(100)).toBe("stuck nonce");
+      expect(trader.health().paused).toBe("stuck nonce");
+      expect(trader.health().pendingStuck).toBe(true);
+      age = 0;
+      expect(internal.quoteGate(101)).toBeNull();
+      expect(trader.health().paused).toBeNull();
+    } finally {
+      config.gasBudgetMon = previousBudget;
+    }
+  });
+
+  test("persists each asynchronous raw fill and the final quote receipt", async () => {
+    const market = fakeMarket(true);
+    const trader = new Trader(market, new ScriptedModel(), () => {});
+    const internals = trader as unknown as {
+      trades: {
+        poll: () => Promise<void>;
+        summary: () => { count: number; buyMon: number; sellMon: number; cvdMon: number; vwap: null; lastPrice: null; lastSide: null };
+        recent: () => [];
+        drainOwn: () => { created: []; canceled: [] };
+        drainPrints: () => [];
+        drainFills: () => { block: number; txHash: string; orderId: number; price: number; size: number; updatedSize: number; side: "buy" | "sell" }[];
+      } | null;
+      applyQuoteResult: (result: QuoteResult) => void;
+    };
+    internals.trades = {
+      poll: async () => {},
+      summary: () => ({ count: 0, buyMon: 0, sellMon: 0, cvdMon: 0, vwap: null, lastPrice: null, lastSide: null }),
+      recent: () => [],
+      drainOwn: () => ({ created: [], canceled: [] }),
+      drainPrints: () => [],
+      drainFills: () => [{ block: 1, txHash: "0xtaker", orderId: 42, price: 0.0258, size: 2, updatedSize: 0, side: "buy" }],
+    };
+
+    await trader.onBlock(1);
+    await Bun.sleep(0); // allow the off-path log poll to harvest and append its fill
+    internals.applyQuoteResult({
+      block: 1,
+      quote: { side: "buy", price: 0.0258, size: 200, txHash: "0xsent", gasMon: 0.0357, cancel: [], status: "placed", orderId: 42, capped: false },
+      canceled: [],
+    });
+    const records = readFileSync("data/events.jsonl", "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(records.some((record) => record.type === "fill" && record.block === 1 && record.fill.orderId === 42)).toBe(true);
+    expect(records.some((record) => record.type === "quote" && record.block === 1 && record.quote.status === "placed")).toBe(true);
   });
 });
