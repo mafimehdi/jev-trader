@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useReducer } from "react";
-import type { BlockEvent, ConnectionState, FeedState, Fill, Meta, Quote } from "./types";
+import { useEffect, useReducer, useState } from "react";
+import type { BlockEvent, ConnectionState, FeedState, Fill, Health, Meta, Quote } from "./types";
 
 export { useUptime } from "./useUptime";
 
@@ -17,14 +17,17 @@ interface State extends FeedState {
   /** running accumulators so avgLatencyMs stays O(1) per event */
   latSum: number;
   latCount: number;
+  /** Guards reported by the server: paused reason, block age, orphaned orders. */
+  health: Health | null;
 }
 
 type Action =
-  | { type: "snapshot"; meta: Meta | null; history: BlockEvent[] }
+  | { type: "snapshot"; meta: Meta | null; health: Health | null; history: BlockEvent[] }
   | { type: "block"; event: BlockEvent }
   | { type: "fill"; block: number; fill: Fill }
   | { type: "quote"; block: number; quote: Quote }
-  | { type: "connection"; connection: ConnectionState };
+  | { type: "connection"; connection: ConnectionState }
+  | { type: "health"; health: Health | null };
 
 const initialState: State = {
   meta: null,
@@ -34,6 +37,8 @@ const initialState: State = {
   avgLatencyMs: 0,
   latSum: 0,
   latCount: 0,
+  health: null,
+  lastBlockSeenAt: 0,
 };
 
 /** latencyMs of a decided (non-late) block, or null if it should not count. */
@@ -57,6 +62,9 @@ function reducer(state: State, action: Action): State {
     case "connection":
       return state.connection === action.connection ? state : { ...state, connection: action.connection };
 
+    case "health":
+      return { ...state, health: action.health };
+
     case "snapshot": {
       const history = Array.isArray(action.history) ? action.history : [];
       const events = history.length > CAP ? history.slice(history.length - CAP) : history;
@@ -71,6 +79,8 @@ function reducer(state: State, action: Action): State {
       }
       return {
         meta: action.meta ?? state.meta,
+        health: action.health ?? state.health,
+        lastBlockSeenAt: Date.now(),
         events,
         latest: events.length ? events[events.length - 1] : null,
         connection: "live",
@@ -138,6 +148,9 @@ function reducer(state: State, action: Action): State {
         ...state,
         events,
         latest: ev,
+        // The block itself carries the pause reason, so the dashboard does not wait a round trip.
+        health: state.health ? { ...state.health, paused: ev.paused ?? null, lastBlock: ev.block, lastBlockTs: ev.ts, ageMs: 0, stale: false } : state.health,
+        lastBlockSeenAt: Date.now(),
         avgLatencyMs: avg(latSum, latCount),
         latSum,
         latCount,
@@ -173,6 +186,25 @@ function reducer(state: State, action: Action): State {
     default:
       return state;
   }
+}
+
+function parseHealth(raw: Record<string, unknown> | null): Health | null {
+  if (!raw || typeof raw !== "object") return null;
+  const h = raw as Record<string, unknown>;
+  return {
+    paused: typeof h.paused === "string" ? h.paused : null,
+    lastBlock: typeof h.lastBlock === "number" ? h.lastBlock : 0,
+    lastBlockTs: typeof h.lastBlockTs === "number" ? h.lastBlockTs : 0,
+    ageMs: typeof h.ageMs === "number" ? h.ageMs : -1,
+    stale: Boolean(h.stale),
+    consecutiveFailures: typeof h.consecutiveFailures === "number" ? h.consecutiveFailures : 0,
+    consecutiveReverts: typeof h.consecutiveReverts === "number" ? h.consecutiveReverts : 0,
+    inflight: typeof h.inflight === "number" ? h.inflight : 0,
+    pendingStuck: Boolean(h.pendingStuck),
+    unknownOrphans: typeof h.unknownOrphans === "number" ? h.unknownOrphans : 0,
+    gasMon: typeof h.gasMon === "number" ? h.gasMon : 0,
+    gasBudgetMon: typeof h.gasBudgetMon === "number" ? h.gasBudgetMon : 0,
+  };
 }
 
 function parseMeta(raw: Record<string, unknown> | null): Meta | null {
@@ -267,7 +299,7 @@ export function useFeed(apiUrl: string): FeedState {
       handle("snapshot", (data) => {
         const d = (data ?? {}) as Record<string, unknown>;
         const history = Array.isArray(d.history) ? (d.history as BlockEvent[]) : [];
-        dispatch({ type: "snapshot", meta: parseMeta(d), history });
+        dispatch({ type: "snapshot", meta: parseMeta(d), health: parseHealth((d.health ?? null) as Record<string, unknown> | null), history });
       });
       handle("block", (data) => {
         dispatch({ type: "block", event: data as BlockEvent });
@@ -283,7 +315,8 @@ export function useFeed(apiUrl: string): FeedState {
         dispatch({ type: "quote", block: d.block, quote: d.quote });
       });
       handle("ping", () => {
-        dispatch({ type: "connection", connection: "live" });
+        // Keep-alive only. Liveness is decided by the age of the last *block*: a dead loop still pings.
+        armStaleTimer();
       });
     }
 
@@ -297,6 +330,23 @@ export function useFeed(apiUrl: string): FeedState {
   }, [apiUrl]);
 
   return state;
+}
+
+/**
+ * True when no block has arrived for STALE_MS, on the client clock: a dead loop keeps the SSE
+ * connection open and keeps pinging, so only the age of the last block proves liveness.
+ */
+export function useStalled(state: FeedState): boolean {
+  const [now, setNow] = useState<number>(0);
+  useEffect(() => {
+    const tick = () => setNow(Date.now());
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
+  if (state.health?.stale) return true;
+  if (!now || !state.lastBlockSeenAt) return false;
+  return now - state.lastBlockSeenAt > STALE_MS;
 }
 
 export default useFeed;

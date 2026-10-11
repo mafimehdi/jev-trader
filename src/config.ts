@@ -27,6 +27,19 @@ export const config = {
   priorityFeeGwei: Number(env("PRIORITY_FEE_GWEI", "2")), // Monad hardcodes eth_maxPriorityFeePerGas at 2
   pendingBlocks: 10, // give up on a tx with no receipt after this many blocks
   refreshBlocks: 200, // how often to refresh the fee estimate, margin balances and the vault check
+  // Guards. Nothing in the block loop may hang or burn gas unattended: every one of these ends in `paused`.
+  modelTimeoutMs: Number(env("MODEL_TIMEOUT_MS", "250")), // a model call past this rejects; the block goes out late
+  modelFailureLimit: Number(env("MODEL_FAILURE_LIMIT", "5")), // consecutive failures that stop quoting (decisions keep retrying)
+  revertLimit: Number(env("REVERT_LIMIT", "3")), // consecutive reverted/lost quotes that stop quoting
+  probeBlocks: Number(env("PROBE_BLOCKS", "400")), // while paused by reverts, one probe tx every this many blocks
+  /** Live only: stop quoting once cumulative gas passes this many MON. 0 = off. A 30 minute session is ~215 MON. */
+  gasBudgetMon: Number(env("GAS_BUDGET_MON", "0")),
+  /** Stop sending while an unconfirmed tx is older than this many blocks (a stuck nonce). */
+  pendingStuckBlocks: Number(env("PENDING_STUCK_BLOCKS", "100")),
+  /** No block for this long marks the snapshot stale, so a wedged loop cannot look live. */
+  staleMs: Number(env("STALE_MS", "5000")),
+  /** Rotate data/events.jsonl once past this size (bytes). It grows ~4 KB per block. 0 = never. */
+  eventLogMaxBytes: Number(env("EVENT_LOG_MAX_BYTES", String(64 * 1024 * 1024))),
   horizonBlocks: Number(env("HORIZON_BLOCKS", "100")), // the model is asked about the move over this many blocks (~30 s)
   model: env("MODEL", "mock") as "mock" | "jev",
   jevModelId: env("JEV_MODEL_ID", "jev-latest")!,

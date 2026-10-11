@@ -9,6 +9,8 @@ export interface HeaderProps {
   meta: Meta | null;
   latest: BlockEvent | null;
   connection: ConnectionState;
+  /** No block for a while: the transport may be up while the loop is wedged. */
+  stalled: boolean;
 }
 
 /** Only shown when we are NOT live. Live is the silent, default state. */
@@ -17,7 +19,7 @@ const OFFLINE_LABEL: Partial<Record<ConnectionState, string>> = {
   reconnecting: "reconnecting",
 };
 
-export default function Header({ meta, latest, connection }: HeaderProps) {
+export default function Header({ meta, latest, connection, stalled }: HeaderProps) {
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -50,7 +52,10 @@ export default function Header({ meta, latest, connection }: HeaderProps) {
     <div className={styles.header}>
       <span className={styles.brand}>‖ Jev Trader</span>
 
-      <span className={styles.block}>block {latest ? fmtInt(latest.block) : "-"}</span>
+      <span className={styles.block} style={stalled ? { color: "var(--late-ink)" } : undefined}>
+        block {latest ? fmtInt(latest.block) : "-"}
+        {stalled ? " stalled" : ""}
+      </span>
 
       <span className={styles.spacer} />
 

@@ -1,0 +1,111 @@
+//@version=6
+// Jev Maker (MON proxy)
+// -----------------------------------------------------------------------------
+// A runnable TradingView strategy that imitates the ORDER PATTERN of jev-trader:
+// every N bars, cancel whatever is resting and post one limit order inside the
+// touch on the side the signal picked, with the same position-cap fallback as
+// src/trader.ts::allowed(). It shares the signal block with jev_signal.pine.
+//
+// It also charges the one cost TradingView will not charge for you: gas. Monad
+// bills gas_limit, not gas_used, so every cancel/replace costs the same whether
+// it lands or reverts. The ledger in the top-right corner shows gross PnL, the
+// gas ledger, and the PnL after gas - which is the whole argument of AUDIT.md
+// made visible on a chart.
+//
+// Read this before trusting any number it prints:
+//   1. TradingView fills limit orders optimistically: any touch of the price
+//      fills you, with no FIFO queue and no adverse selection. Real maker fills
+//      are worse. Treat the gross PnL as an upper bound, not a forecast.
+//   2. There is no L2 book in Pine, so "spread" is a manual assumption: the
+//      spread gate below uses the input, not the real touch.
+//   3. This trades a TradingView symbol (e.g. BINANCE:MONUSDT), not Kuru's
+//      MON-USDC on Monad: different venue, different tick, different flow.
+// -----------------------------------------------------------------------------
+
+strategy("Jev Maker (MON proxy)", overlay=true, initial_capital=100, default_qty_type=strategy.fixed, default_qty_value=200, pyramiding=10, commission_type=strategy.commission.percent, commission_value=0.0, slippage=0, process_orders_on_close=false)
+
+// ── Model inputs (defaults mirror src/model.ts MockModel) ────────────────────
+momDiv  = input.float(8.0, "momentum divisor (ret20 / x)", step=0.5, group="Model")
+imbW    = input.float(1.5, "imbalance weight (pressure * x)", step=0.1, group="Model")
+flowW   = input.float(2.0, "flow weight (cvd * x)", step=0.1, group="Model")
+horizon = input.int(100, "flow horizon (bars)", minval=5, group="Model")
+
+// ── Quoting (defaults mirror .env.example) ───────────────────────────────────
+updateEvery = input.int(1, "cancel/replace every N bars", minval=1, group="Quoting")
+offsetBps   = input.float(0.39, "quote this far inside the touch (bps)", step=0.05, group="Quoting")
+spreadNow   = input.float(16.0, "assumed touch spread now (bps, no L2 in Pine)", step=1.0, group="Quoting")
+spreadFloor = input.float(7.0, "do not quote below this spread (bps)", step=0.5, group="Quoting")
+orderQty    = input.int(200, "order size (MON, Kuru minimum is 200)", minval=1, group="Quoting")
+maxPos      = input.int(1000, "max |position| (MON)", minval=100, group="Quoting")
+
+// ── Costs ────────────────────────────────────────────────────────────────────
+// Measured on 2026-10-11: 350k gas limit x 102 gwei = 0.0357 MON = $0.00092 at
+// MON = $0.0258. Zero out this input to see the strategy "without Monad".
+gasPerUpdate = input.float(0.00092, "gas per update (quote ccy, measured)", step=0.00001, group="Costs")
+
+// ── Signal block (identical to jev_signal.pine) ──────────────────────────────
+rng  = math.max(high - low, syminfo.mintick)
+r20  = nz((close - close[20]) / close[20]) * 10000.0
+
+deltaVol = (close - open) / rng * volume
+flowWin  = math.sum(deltaVol, horizon)
+volWin   = math.sum(volume, horizon)
+flow     = volWin > 0 ? flowWin / volWin : 0.0
+
+pressure = math.sum(deltaVol, 10) / math.max(math.sum(volume, 10), 1)
+
+signal = r20 / momDiv + pressure * imbW + flow * flowW
+buyP   = 1.0 / (1.0 + math.exp(-signal))
+
+// ── Side selection with the position-cap fallback (src/trader.ts::allowed) ───
+wantBuy  = buyP >= 0.5
+capLong  = strategy.position_size + orderQty <= maxPos
+capShort = strategy.position_size - orderQty >= -maxPos
+side     = wantBuy ? (capLong ? 1 : capShort ? -1 : 0) : (capShort ? -1 : capLong ? 1 : 0)
+
+// ── The loop: cancel everything, post one post-only-equivalent limit order ───
+var int updates = 0
+var int fills   = 0
+if strategy.position_size != nz(strategy.position_size[1])
+    fills += 1
+
+bid = close * (1.0 - offsetBps / 10000.0)
+ask = close * (1.0 + offsetBps / 10000.0)
+
+if bar_index % updateEvery == 0 and spreadNow >= spreadFloor and side != 0
+    strategy.cancel_all()
+    if side == 1
+        strategy.entry("L", strategy.long, qty=orderQty, limit=bid)
+    else
+        strategy.entry("S", strategy.short, qty=orderQty, limit=ask)
+    updates += 1
+
+plot(side == 1 ? bid : side == -1 ? ask : na, "quote", color=color.new(color.orange, 0), style=plot.style_circles, display=display.data_window)
+
+// ── Gas ledger: what the chain takes whether the order lands or not ──────────
+gasCost = updates * gasPerUpdate
+netAdj  = strategy.netprofit - gasCost
+
+plot(strategy.netprofit, "gross $", color=color.new(#26a69a, 0), display=display.data_window)
+plot(netAdj, "after gas $", color=color.new(#ef5350, 0), display=display.data_window)
+
+fmt(x) => str.tostring(x, "#.####")
+
+var table t = table.new(position.top_right, 2, 8, border_width=1, frame_width=1)
+if barstate.islast
+    table.cell(t, 0, 0, "Jev Maker (proxy)", text_size=size.small)
+    table.cell(t, 1, 0, timeframe.period, text_size=size.small)
+    table.cell(t, 0, 1, "updates", text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(updates), text_size=size.small)
+    table.cell(t, 0, 2, "fills", text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(fills), text_size=size.small)
+    table.cell(t, 0, 3, "gross $", text_size=size.small)
+    table.cell(t, 1, 3, fmt(strategy.netprofit), text_size=size.small)
+    table.cell(t, 0, 4, "gas $", text_size=size.small)
+    table.cell(t, 1, 4, fmt(gasCost), text_size=size.small)
+    table.cell(t, 0, 5, "after gas $", text_size=size.small)
+    table.cell(t, 1, 5, fmt(netAdj), text_size=size.small)
+    table.cell(t, 0, 6, "gas per fill $", text_size=size.small)
+    table.cell(t, 1, 6, fmt(gasCost / math.max(fills, 1)), text_size=size.small)
+    table.cell(t, 0, 7, "side now", text_size=size.small)
+    table.cell(t, 1, 7, side == 1 ? "buy" : side == -1 ? "sell" : "capped", text_size=size.small)

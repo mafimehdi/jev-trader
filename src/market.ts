@@ -62,6 +62,21 @@ const gwei = (n: number) => ethers.utils.parseUnits(String(n), "gwei");
 const BN = ethers.BigNumber;
 const ZERO_ADDRESS = ethers.constants.AddressZero;
 
+/**
+ * Monad bills the limit, not the usage, so the limit *is* the cost: pick the tightest one that still
+ * fits. Use the exact shape measured in a receipt when we have it; otherwise the nearest measured
+ * shape plus 45k per extra cancel (a cancel touches two price points at most). x1.15 headroom, never
+ * below `floor` (the startup estimate for a place with no cancels).
+ */
+export function tightLimit(used: Map<number, number>, cancelCount: number, fallback: number, floor = 0): number {
+  const exact = used.get(cancelCount);
+  if (exact !== undefined) return Math.max(Math.ceil(exact * 1.15), floor);
+  let nearest: number | undefined;
+  for (const k of used.keys()) if (nearest === undefined || Math.abs(k - cancelCount) < Math.abs(nearest - cancelCount)) nearest = k;
+  if (nearest === undefined) return Math.max(fallback, floor);
+  return Math.max(Math.ceil((used.get(nearest)! + 45_000 * Math.max(0, cancelCount - nearest)) * 1.15), floor);
+}
+
 interface Pending { block: number; quote: Quote; gasLimit: ethers.BigNumber }
 
 /** Kuru MON-USDC market: read the book, post one limit order per block, confirm asynchronously. */
@@ -76,7 +91,13 @@ export class Market {
   private marginIface = new ethers.utils.Interface(MarginAccountAbi.abi);
   private nonce = 0;
   private feeWei = gwei(102); // base + priority, last known; Monad's floor is 100 + 2
+  /** The limit the next send goes out with: `nextLimit()` moves it down once a shape is measured. */
   private gasLimit = BN.from(config.gasLimitFallback);
+  /** Startup estimate for a place with no cancels: the floor for every tightened limit. */
+  private gasFloor = 0;
+  private fixedLimit = Boolean(config.gasLimit);
+  /** Measured gasUsed per cancel count, from receipts we have seen. */
+  private gasUsed = new Map<number, number>();
   private useVault = false;
   private pending = new Map<string, Pending>();
 
@@ -134,7 +155,10 @@ export class Market {
    */
   async send(block: number, side: Side, sizeMon: number, book: Book, cancel: number[], capped: boolean): Promise<Quote> {
     const price = this.quotePrice(side, book);
-    if (!this.wallet) return { side, price, size: sizeMon, txHash: null, gasMon: 0, cancel, status: "sim", orderId: null, capped };
+    this.gasLimit = BN.from(this.nextLimit(cancel.length));
+    // Dry run: nothing is signed, but the gas a live send burns is real money. Charge it, so the
+    // dashboard P&L is the same number that a live run would show.
+    if (!this.wallet) return { side, price, size: sizeMon, txHash: null, gasMon: this.gasMon(this.gasLimit, this.feeWei), cancel, status: "sim", orderId: null, capped };
 
     const tx = this.buildTx(side, sizeMon, price, cancel);
     const signed = await this.wallet.signTransaction(tx);
@@ -151,6 +175,19 @@ export class Market {
     return quote;
   }
 
+  /** Age in blocks of the oldest in-flight tx (0 when nothing is pending). A stuck nonce shows up here. */
+  pendingAge(block: number): number {
+    let age = 0;
+    for (const p of this.pending.values()) age = Math.max(age, block - p.block);
+    return age;
+  }
+
+  /** The limit to send with, given how many orders this quote cancels. */
+  private nextLimit(cancelCount: number): number {
+    if (this.fixedLimit) return this.gasLimit.toNumber();
+    return tightLimit(this.gasUsed, cancelCount, config.gasLimitFallback, this.gasFloor);
+  }
+
   /** One eth_getTransactionReceipt per in-flight tx. Returns whatever resolved (or timed out). */
   async pollPending(block: number): Promise<QuoteResult[]> {
     if (!this.pending.size) return [];
@@ -165,7 +202,9 @@ export class Market {
       } else if (block - p.block >= config.pendingBlocks) {
         this.pending.delete(hash);
         lost = true;
-        out.push({ block: p.block, quote: { ...p.quote, status: "lost", gasMon: 0 }, canceled: [] });
+        // Keep the gas this send was quoted at: the tx either never landed (a small over-report) or
+        // landed without a receipt we ever saw (real spend). Under-reporting spend is the worse error.
+        out.push({ block: p.block, quote: { ...p.quote, status: "lost" }, canceled: [] });
       }
     }));
     if (lost) await this.resyncNonce().catch(() => {});
@@ -192,6 +231,13 @@ export class Market {
   /** OrderCreated for our address gives the new order id; OrdersCanceled lists what the tx removed. status 0x0: nothing changed on the book. */
   private parseReceipt(r: any, p: Pending): QuoteResult {
     if (r.effectiveGasPrice) this.feeWei = BN.from(r.effectiveGasPrice);
+    // A placed receipt is the one place that shows what this shape actually costs. Record it so the
+    // next limit for the same cancel count can be tightened to it.
+    if (r.status !== "0x0" && r.gasUsed) {
+      const used = Number(BN.from(r.gasUsed).toString());
+      const k = p.quote.cancel.length;
+      if (used > (this.gasUsed.get(k) ?? 0)) this.gasUsed.set(k, used);
+    }
     const gasMon = this.gasMon(p.gasLimit, BN.from(r.effectiveGasPrice ?? this.feeWei));
     const me = this.wallet!.address.toLowerCase();
     let orderId: number | null = null;
@@ -262,13 +308,16 @@ export class Market {
         const side: Side = this.margin.usdc >= config.tradeSizeMon * book.ask ? "buy" : "sell";
         const data = this.encode(side, config.tradeSizeMon, this.quotePrice(side, book), []);
         const est = await this.provider.estimateGas({ to: config.market, from: this.wallet!.address, data });
-        this.gasLimit = est.add(90_000).mul(115).div(100);
+        this.gasFloor = est.toNumber();
+        this.gasUsed.set(0, est.toNumber()); // exact for a place with no cancels: limit = est x 1.15
+        this.gasLimit = BN.from(this.nextLimit(0));
       } catch (e) {
         console.warn(`gas estimate failed (${(e as Error).message.slice(0, 120)}); using ${config.gasLimitFallback}`);
       }
     }
     const perBlock = this.gasMon(this.gasLimit, this.feeWei);
     console.log(`gas limit ${this.gasLimit} · maxFee ${config.maxFeeGwei} gwei · priority ${config.priorityFeeGwei} gwei · ~${perBlock.toFixed(4)} MON per block, ~${(perBlock * 12_000).toFixed(0)} MON per hour`);
+    if (!this.fixedLimit) console.log("gas limit tightens per shape from receipts (billed on the limit, so the limit is the cost)");
   }
 
   private gasMon(limit: ethers.BigNumber, feeWei: ethers.BigNumber) {

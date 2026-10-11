@@ -39,6 +39,31 @@ export interface Model {
   decide(state: TradeState): Promise<Decision>;
 }
 
+/** A model call that missed the block deadline. The loop treats it as a late block, never as a hang. */
+export class ModelTimeout extends Error {
+  constructor(ms: number) {
+    super(`model timeout after ${ms}ms`);
+    this.name = "ModelTimeout";
+  }
+}
+
+/**
+ * Wrap a model so no call can wedge the block loop: the race rejects at `ms` and the timer is
+ * cleared as soon as the model answers, so a fast model pays nothing for the guard.
+ */
+export function withDeadline(model: Model, ms: number): Model {
+  return {
+    name: model.name,
+    decide: (state: TradeState): Promise<Decision> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ModelTimeout(ms)), ms);
+      });
+      return Promise.race([model.decide(state), deadline]).finally(() => clearTimeout(timer));
+    },
+  };
+}
+
 const QUESTIONS = {
   direction: {
     type: "choice",
@@ -62,7 +87,15 @@ export class JevModel implements Model {
 
   async decide(state: TradeState): Promise<Decision> {
     const t0 = performance.now();
-    const r = await experimental_evaluate({ model: this.model, state: state as any, questions: QUESTIONS, maxRetries: 0 });
+    // abortSignal is best effort: it cancels the HTTP request when the transport honours it, while
+    // withDeadline() is what actually frees the block loop.
+    const r = await experimental_evaluate({
+      model: this.model,
+      state: state as any,
+      questions: QUESTIONS,
+      maxRetries: 0,
+      abortSignal: AbortSignal.timeout(config.modelTimeoutMs),
+    });
     const a = r.answers.direction;
     const p = a.probabilities ?? { buy: 0, sell: 0, [a.choice]: 1 };
     const buy = p.buy ?? 0, sell = p.sell ?? 0;
@@ -104,4 +137,5 @@ export class MockModel implements Model {
   }
 }
 
-export const createModel = (): Model => (config.model === "jev" ? new JevModel() : new MockModel());
+export const createModel = (): Model =>
+  withDeadline(config.model === "jev" ? new JevModel() : new MockModel(), config.modelTimeoutMs);

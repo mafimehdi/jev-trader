@@ -13,12 +13,14 @@ const model = createModel();
 const server = startServer(
   { model: model.name, wallet: market.address, dryRun: config.dryRun, market: config.market, startedAt: Date.now() },
   () => trader.history,
+  () => trader.health(),
 );
 const trader = new Trader(
   market,
   model,
   (e, t) => {
     server.broadcast(e);
+    if (e.paused) return; // the transition itself was logged; do not repeat it every block
     if (e.decision && !e.decision.late) {
       const p = e.decision.probabilities;
       const q = e.quote;
@@ -35,7 +37,9 @@ const trader = new Trader(
     if (quote.status !== "placed") console.log(`#${block} ${quote.status.toUpperCase()} ${quote.side} @ ${quote.price.toFixed(6)} gas ${quote.gasMon.toFixed(6)} MON ${quote.txHash}`);
   },
 );
-trader.attachTradeFeed(log10(market.params.sizePrecision));
+// OrderCreated prices are in pricePrecision units, unlike Trade's 1e18.
+trader.attachTradeFeed(log10(market.params.sizePrecision), log10(market.params.pricePrecision));
 
-console.log(`jev-trader · model=${model.name} · post-only ${config.quoteInsideTicks} tick inside the touch · horizon ${config.horizonBlocks} blocks · ${config.dryRun ? "DRY RUN" : `wallet ${market.address}`} · market ${config.market} · read ${config.readRpcUrl} · :${config.port}`);
+console.log(`jev-trader · model=${model.name} · post-only ${config.quoteInsideTicks} tick inside the touch · horizon ${config.horizonBlocks} blocks · ${config.dryRun ? "DRY RUN (gas is simulated and charged)" : `wallet ${market.address}`} · market ${config.market} · read ${config.readRpcUrl} · :${config.port}`);
+if (config.gasBudgetMon > 0) console.log(`gas budget ${config.gasBudgetMon} MON (live only); model deadline ${config.modelTimeoutMs}ms`);
 startBlockFeed((block) => trader.onBlock(block));

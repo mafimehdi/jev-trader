@@ -14,9 +14,14 @@ With no `PRIVATE_KEY` it dry-runs: real book, real decisions, simulated fills. S
 
 Deployed (dry run, mock model): https://jev-trader-production.up.railway.app
 
-- `GET /` snapshot: model, wallet, dryRun, latest block event
+- `GET /` snapshot: model, wallet, dryRun, `health`, latest block event
+- `GET /health` the guards alone: `paused`, `lastBlockTs`, `ageMs`, `stale`, inflight, unknown orphans, gas
 - `GET /history` last 1000 block events
 - `GET /events` SSE: `snapshot` on connect, then one `block` event per block, plus a `fill` event whenever a live order's receipt lands
+
+`health.stale` and `health.paused` are how "running" is told from "wedged": the transport can be up
+(`ping` every 15 s) while no block is being decided, and the dashboard shows that as `stalled` instead
+of live.
 
 Every event (see `src/trader.ts` for types):
 
@@ -33,7 +38,7 @@ Every event (see `src/trader.ts` for types):
 
 Every block the model is asked about the move over `HORIZON_BLOCKS` (default 100, ~30 s) and answers `buy` or `sell`. `quote` is the order that block put on the book: a post-only limit order of `TRADE_SIZE_MON` on that side, `QUOTE_INSIDE_TICKS` inside the touch (clamped to the touch when the spread is too tight), in one `batchUpdate` that also cancels everything we had resting (`cancel`). `hold` appears only with `decision.late: true`, when the model missed the block and nothing was posted. When the position cap (or, live, margin funds) blocks a side, the quote goes on the other side with `capped: true` and `probabilities` still show the model's call. `resting` is our size known to be on the book after this block. `upIn10` equals the buy probability.
 
-Live sends are fired and forgotten, so the `block` event carries the **intent**: `status: "sent"`, `gasMon` is `gasLimit x (last known base fee + priority)`. Monad charges the gas limit, so that is the real cost whether the order lands or not. The receipt arrives a block or two later as its own SSE event:
+Live sends are fired and forgotten, so the `block` event carries the **intent**: `status: "sent"`, `gasMon` is `gasLimit x (last known base fee + priority)`. Monad charges the gas limit, so that is the real cost whether the order lands or not. The same applies to a dry run: a simulated quote is charged the gas a live send would burn, so the dashboard P&L is not flattered by a zero. The receipt arrives a block or two later as its own SSE event:
 
     event: quote
     data: { "block": 105488269, "quote": { …, "status": "placed", "orderId": 100295812, "gasMon": 0.0357 } }
@@ -43,7 +48,25 @@ Live sends are fired and forgotten, so the `block` event carries the **intent**:
     event: fill
     data: { "block": 105488271, "fill": { "side": "buy", "size": 200, "price": 0.022629, "txHash": "0x…", "orderId": 100295812, "simulated": false } }
 
-`txHash` is the taker's transaction. In a dry run the quote is `status: "sim"`: the order rests for one block and a real print crossing its price fills it (`simulated: true`).
+`txHash` is the taker's transaction. In a dry run the quote is `status: "sim"`: the order rests for one block and a real print crossing its price fills it (`simulated: true`), and it is charged the gas a live send would have burned.
+
+## Guards
+
+Nothing in the loop may hang or spend unattended, so every failure mode ends in a named pause rather
+than a silent stall. `paused` is echoed on each block event and in `health`:
+
+| `paused` | When | Back |
+|---|---|---|
+| `model` | `MODEL_FAILURE_LIMIT` model calls in a row failed (a call past `MODEL_TIMEOUT_MS` counts as late, not as a failure) | by itself, on the next answered decision |
+| `reverts` | `REVERT_LIMIT` consecutive reverted or lost quotes | one probe tx every `PROBE_BLOCKS`, until a quote lands |
+| `stuck nonce` | an unconfirmed tx older than `PENDING_STUCK_BLOCKS` | when the pending txs confirm |
+| `gas budget` | live only; cumulative gas past `GAS_BUDGET_MON` | never, it is a hard stop |
+
+Two more counters in `health`: `inflight` (sends without a receipt) and `unknownOrphans` (lost
+receipts whose order id never surfaced; the log feed adopts such an order the moment it appears, and
+the count drops). `data/events.jsonl` rotates past `EVENT_LOG_MAX_BYTES`.
+
+`bun test` covers the deadline, the gas-limit maths, the log decoders and the pause transitions.
 
 ## Layout
 
@@ -52,17 +75,19 @@ Live sends are fired and forgotten, so the `block` event carries the **intent**:
     src/book.ts     one-eth_call order book reader (decodes getL2Book, merges the AMM vault)
     src/market.ts   Kuru: read book, hand-encoded batchUpdate (cancel + post-only place), margin deposits, local nonce, async confirmation
     src/model.ts    Model interface, JevModel (AI SDK experimental_evaluate), MockModel
-    src/trader.ts   the loop: one in flight, hold when late, position and P&L accounting
-    src/server.ts   Bun.serve: snapshot, history, SSE
+    src/trader.ts   the loop: one in flight, hold when late, guards, position and P&L accounting
+    src/server.ts   Bun.serve: snapshot, health, history, SSE
+    src/robustness.test.ts  deadline, gas limit, log decoders, pause transitions
 
 ## The 300 ms budget
 
 A decision and an order have to fit in one block, so the hot loop makes exactly two RPC round trips:
 one `eth_call` for the book (~18 ms on the public RPC, `READ_RPC_URL`) and one `eth_sendRawTransaction`
 (`RPC_URL`), which returns as soon as the tx is accepted. Nothing else is on the path — no
-`eth_estimateGas` (Monad charges gas on the limit, so the limit is hardcoded or derived once at
-startup), no `eth_sendRawTransactionSync` (it blocks until the tx is Proposed), no gas price lookup
-(static type-2 fees: `MAX_FEE_GWEI` cap, 2 gwei priority; the effective price is base + priority).
+`eth_estimateGas` (Monad charges gas on the limit, so the limit is measured off the hot path instead:
+one estimate at startup, then the tightest limit per shape, x1.15, from the `gasUsed` in receipts we
+have already seen), no `eth_sendRawTransactionSync` (it blocks until the tx is Proposed), no gas price
+lookup (static type-2 fees: `MAX_FEE_GWEI` cap, 2 gwei priority; the effective price is base + priority).
 Receipts, the fee estimate and the vault check run off the hot path on later blocks. Measured in a
 dry run with the mock model: read p50 18 ms, whole loop p50 100 ms (80 ms of it the mock's inference stand-in).
 

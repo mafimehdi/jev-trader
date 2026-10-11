@@ -1,7 +1,7 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { config } from "./config";
 import { Market, type Book, type Fill, type Quote, type QuoteResult, type Side } from "./market";
-import type { Action, Decision, Model, TradeState } from "./model";
+import { ModelTimeout, type Action, type Decision, type Model, type TradeState } from "./model";
 import { TradeFeed, type MakerFill, type TradePrint } from "./trades";
 
 export interface BlockEvent {
@@ -20,6 +20,26 @@ export interface BlockEvent {
   resting: { bidMon: number; askMon: number };
   position: { side: "long" | "short" | "flat"; size: number; entryPrice: number | null; unrealizedUsd: number; unrealizedMon: number };
   totals: Totals;
+  /** Why quoting is stopped ("model", "reverts", "stuck nonce", "gas budget"), or null while quoting. */
+  paused: string | null;
+}
+
+/** What the dashboard needs to tell "running" from "wedged". Served at GET / and in the SSE snapshot. */
+export interface Health {
+  paused: string | null;
+  lastBlock: number;
+  lastBlockTs: number;
+  /** ms since the last block, -1 when no block has been seen at all. */
+  ageMs: number;
+  stale: boolean;
+  consecutiveFailures: number;
+  consecutiveReverts: number;
+  inflight: number;
+  pendingStuck: boolean;
+  /** Lost receipts whose order id never surfaced. An upper bound: a lost tx may never have landed. */
+  unknownOrphans: number;
+  gasMon: number;
+  gasBudgetMon: number;
 }
 
 /** Per-block latency: the book read, and read + decide + send end to end. */
@@ -52,6 +72,12 @@ interface Resting { side: Side; price: number; size: number; block: number }
  * (`placed` with an order id, or `reverted`) is applied when it turns up on a later block. Fills
  * come from the Trade log feed: a taker hit one of our resting orders. Dry runs simulate both:
  * the order rests for one block and fills when a real print crosses its price.
+ *
+ * Nothing here is allowed to run unattended into a hole. Four guards stop quoting and say why:
+ * a model that keeps missing its deadline (`paused: "model"`, clears itself on the next answer), a
+ * run of reverted/lost quotes (`paused: "reverts"`, retried by one probe tx every `probeBlocks`), a
+ * stuck nonce (`paused: "stuck nonce"`, clears when the pending txs land) and the gas budget
+ * (`paused: "gas budget"`, live only, final). `health()` reports all of it.
  */
 export class Trader {
   readonly history: BlockEvent[] = [];
@@ -59,13 +85,21 @@ export class Trader {
   private busy = false;
   private lastBook: Book | null = null;
   private trades: TradeFeed | null = null;
-  /** Orders we know are resting on the book (live: from receipts; dry run: last block's simulated order). */
+  /** Orders we know are resting on the book (live: from receipts or the log feed; dry run: last block's simulated order). */
   private orders = new Map<number, Resting>();
   /** Live quotes sent but not yet confirmed; they may become resting orders, so they count toward the cap. */
   private inflight = new Map<string, Quote>();
   private simId = 0;
   private position = { mon: 0, costUsd: 0 }; // signed inventory and its cost basis
   private totals: Totals = { blocks: 0, decisions: 0, quotes: 0, fills: 0, reverted: 0, lateBlocks: 0, jevUsd: 0, gasMon: 0, gasUsd: 0, realizedUsd: 0, pnlUsd: 0, pnlMon: 0, pnlPct: 0 };
+  private paused: string | null = null;
+  private failures = 0; // consecutive model failures
+  private reverts = 0; // consecutive reverted/lost quotes
+  private probeAt = 0; // while paused by reverts, the next block a probe send is allowed
+  private unknownOrphans = 0; // lost receipts whose order id never surfaced
+  private lastBlock = 0;
+  private lastBlockTs = 0;
+  private logBytes = 0;
 
   constructor(
     private market: Market,
@@ -75,15 +109,21 @@ export class Trader {
     private onQuote: (block: number, quote: Quote) => void = () => {},
   ) {
     mkdirSync("data", { recursive: true });
+    try { this.logBytes = statSync("data/events.jsonl").size; } catch { this.logBytes = 0; }
   }
 
-  /** Call once the market params are known. Without it `trades` in the state is all zeros and no fills are ever seen. */
-  attachTradeFeed(sizeDec: number) {
-    this.trades = new TradeFeed({ market: config.market, url: config.readRpcUrl, sizeDec, maker: this.market.address });
+  /**
+   * Call once the market params are known. Without it `trades` in the state is all zeros and no fills
+   * are ever seen. `orderPriceDec` is the OrderCreated unit (log10 pricePrecision), not Trade's 1e18.
+   */
+  attachTradeFeed(sizeDec: number, orderPriceDec?: number) {
+    this.trades = new TradeFeed({ market: config.market, url: config.readRpcUrl, sizeDec, orderPriceDec, maker: this.market.address });
   }
 
   async onBlock(block: number) {
     this.totals.blocks++;
+    this.lastBlock = block;
+    this.lastBlockTs = Date.now();
     this.confirmPending(block); // off the hot path: receipts for earlier blocks' sends
     if (this.totals.blocks % config.refreshBlocks === 0) this.market.refresh().catch(() => {}); // fee estimate + margin + vault check
     if (this.busy) {
@@ -99,9 +139,32 @@ export class Trader {
       this.lastBook = book;
       this.mids.push(book.mid);
       if (this.mids.length > 400) this.mids.shift();
-      this.trades?.poll(block).then(() => this.harvest()); // off the hot path: eth_getLogs for prints (and our fills) since the last poll
+      this.trades?.poll(block).then(() => this.harvest()); // off the hot path: eth_getLogs for prints, fills and our order lifecycle
 
-      const decision = await this.model.decide(this.buildState(block, book));
+      let decision: Decision;
+      try {
+        decision = await this.model.decide(this.buildState(block, book));
+      } catch (e) {
+        // A model that hangs or errors must never wedge the loop (and never leave `busy` set): count it,
+        // emit the block with no quote, and keep asking every block until it answers again.
+        this.failures++;
+        const why = (e as Error).message || String(e);
+        if (this.failures >= config.modelFailureLimit && this.paused !== "model") {
+          this.paused = "model";
+          console.warn(`block ${block}: ${this.failures} model calls in a row failed (${why}); quoting paused, decisions keep retrying`);
+        } else if (e instanceof ModelTimeout) {
+          console.warn(`block ${block}: model late (${why})`);
+        } else {
+          console.error(`block ${block}: model failed (${why})`);
+        }
+        this.emit(block, book, null, null, false, { readMs: Math.round(readMs), loopMs: Math.round(performance.now() - t0) });
+        return;
+      }
+      if (this.failures > 0) {
+        this.failures = 0;
+        if (this.paused === "model") { this.paused = null; console.log(`block ${block}: model recovered, quoting resumed`); }
+      }
+
       const wanted: Side = decision.action === "sell" ? "sell" : "buy";
       const other: Side = wanted === "buy" ? "sell" : "buy";
       // The position cap (and, live, margin funds) can only pick the reducing side. The probabilities still show the model's call.
@@ -110,17 +173,20 @@ export class Trader {
       this.totals.jevUsd += (decision.inputTokens / 1e6) * config.jevUsdPerMTok;
 
       let quote: Quote | null = null;
-      if (side) {
+      const gate = this.quoteGate(block);
+      if (side && !gate) {
         decision.action = side;
         const cancel = [...this.orders.keys()].filter((id) => id > 0); // simulated orders have negative ids
         quote = await this.market.send(block, side, config.tradeSizeMon, book, cancel, side !== wanted);
         this.totals.quotes++;
         if (quote.status === "sim") {
+          this.totals.gasMon += quote.gasMon; // a dry run still burns the gas a live send would
           this.orders.clear(); // the simulated cancel
           this.orders.set(--this.simId, { side, price: quote.price, size: quote.size, block });
         } else if (quote.txHash) {
           this.inflight.set(quote.txHash, quote);
         }
+        if (this.paused === "reverts") { this.probeAt = block + config.probeBlocks; console.log(`block ${block}: probe tx sent while paused by reverts`); }
       }
       this.emit(block, book, decision, quote, false, { readMs: Math.round(readMs), loopMs: Math.round(performance.now() - t0) });
     } catch (e) {
@@ -128,6 +194,51 @@ export class Trader {
     } finally {
       this.busy = false;
     }
+  }
+
+  /**
+   * Null when this block may send; otherwise the reason quoting is stopped. Ordered by how final the
+   * reason is: gas budget (live only, done), reverts (probe now and then), stuck nonce (wait it out),
+   * model (already handled before the quote is attempted).
+   */
+  private quoteGate(block: number): string | null {
+    if (this.market.wallet && config.gasBudgetMon > 0 && this.totals.gasMon >= config.gasBudgetMon) {
+      if (this.paused !== "gas budget") {
+        this.paused = "gas budget";
+        console.warn(`gas budget ${config.gasBudgetMon} MON reached at block ${block}: quoting stopped for good`);
+      }
+      return "gas budget";
+    }
+    if (this.paused === "reverts") return block >= this.probeAt ? null : "reverts";
+    const pendingAge = this.market.pendingAge(block);
+    if (pendingAge >= config.pendingStuckBlocks) {
+      if (this.paused !== "stuck nonce") {
+        this.paused = "stuck nonce";
+        console.warn(`block ${block}: oldest unconfirmed tx is ${pendingAge} blocks old (stuck nonce?); quoting paused`);
+      }
+      return "stuck nonce";
+    }
+    if (this.paused === "stuck nonce") { this.paused = null; console.log(`block ${block}: pending txs confirmed, quoting resumed`); }
+    return this.paused;
+  }
+
+  /** Snapshot of the guards for GET / and the SSE snapshot. */
+  health(): Health {
+    const ageMs = this.lastBlockTs ? Date.now() - this.lastBlockTs : -1;
+    return {
+      paused: this.paused,
+      lastBlock: this.lastBlock,
+      lastBlockTs: this.lastBlockTs,
+      ageMs,
+      stale: ageMs < 0 || ageMs > config.staleMs,
+      consecutiveFailures: this.failures,
+      consecutiveReverts: this.reverts,
+      inflight: this.inflight.size,
+      pendingStuck: this.market.pendingAge(this.lastBlock) >= config.pendingStuckBlocks,
+      unknownOrphans: this.unknownOrphans,
+      gasMon: round(this.totals.gasMon, 6),
+      gasBudgetMon: config.gasBudgetMon,
+    };
   }
 
   /** One eth_getTransactionReceipt per in-flight tx, in parallel with this block's decision. */
@@ -140,17 +251,48 @@ export class Trader {
   private applyQuoteResult({ block, quote, canceled }: QuoteResult) {
     if (quote.txHash) this.inflight.delete(quote.txHash);
     this.totals.gasMon += quote.gasMon; // charged on reverts too
-    if (quote.status === "reverted") this.totals.reverted++;
     for (const id of canceled) this.orders.delete(id);
+
+    // Breaker: a run of reverted or lost quotes is not bad luck, it is the market telling us not to
+    // send. Pause and retry with a single probe tx every `probeBlocks` instead of paying every block.
+    if (quote.status === "placed") {
+      this.reverts = 0;
+      if (this.paused === "reverts") { this.paused = null; console.log(`block ${block}: a quote landed again, quoting resumed`); }
+    } else if (quote.status === "reverted" || quote.status === "lost") {
+      if (quote.status === "reverted") this.totals.reverted++;
+      if (quote.status === "lost") this.unknownOrphans++; // the order may exist on the book; the log feed will say so
+      this.reverts++;
+      if (this.reverts >= config.revertLimit && this.paused !== "reverts") {
+        this.paused = "reverts";
+        this.probeAt = block + config.probeBlocks;
+        console.warn(`block ${block}: ${this.reverts} quotes in a row reverted or lost; quoting paused, one probe every ${config.probeBlocks} blocks`);
+      }
+    }
     if (quote.status === "placed" && quote.orderId !== null) this.orders.set(quote.orderId, { side: quote.side, price: quote.price, size: quote.size, block });
     const e = this.history.find((h) => h.block === block);
     if (e) e.quote = quote;
     this.onQuote(block, quote);
   }
 
-  /** After each trade-log poll: apply our maker fills (live) or simulate them against the new prints (dry run). */
+  /**
+   * After each trade-log poll: adopt and drop our own orders, then apply maker fills (live) or simulate
+   * them against the new prints (dry run).
+   */
   private harvest() {
     if (!this.trades) return;
+    // Our order lifecycle first: an order whose receipt never arrived is on the book right now, and it
+    // has to be cancelable (and counted toward the cap) before fills are matched against it.
+    const own = this.trades.drainOwn();
+    for (const o of own.created) {
+      if (this.orders.has(o.orderId)) continue;
+      this.orders.set(o.orderId, { side: o.side, price: o.price, size: o.size, block: o.block });
+      if (this.unknownOrphans > 0) {
+        this.unknownOrphans--;
+        console.warn(`block ${o.block}: adopted order ${o.orderId} (${o.side} ${o.size} @ ${o.price}); its receipt never arrived`);
+      }
+    }
+    for (const id of own.canceled) this.orders.delete(id);
+
     const prints = this.trades.drainPrints();
     const fills: Fill[] = this.market.wallet ? this.liveFills(this.trades.drainFills()) : this.simFills(prints);
     if (!fills.length) return;
@@ -285,11 +427,23 @@ export class Trader {
         size, entryPrice: this.entryPrice(), unrealizedUsd: round(unrealized, 4), unrealizedMon: round(unrealized / book.mid, 4),
       },
       totals: { ...t, jevUsd: round(t.jevUsd, 6), gasMon: round(t.gasMon, 6), gasUsd: round(t.gasUsd, 6), realizedUsd: round(t.realizedUsd, 4), pnlUsd: round(t.pnlUsd, 4), pnlMon: round(t.pnlMon, 4), pnlPct: round(t.pnlPct, 3) },
+      paused: this.paused,
     };
     this.history.push(event);
     if (this.history.length > config.historySize) this.history.shift();
-    appendFileSync("data/events.jsonl", JSON.stringify(event) + "\n");
+    this.appendEvent(event);
     this.onEvent(event, timing);
+  }
+
+  /** `data/events.jsonl` grows ~4 KB per block: rotate past the cap so a long run cannot fill the disk. */
+  private appendEvent(event: BlockEvent) {
+    const line = JSON.stringify(event) + "\n";
+    if (config.eventLogMaxBytes > 0 && this.logBytes + line.length > config.eventLogMaxBytes) {
+      try { renameSync("data/events.jsonl", "data/events.jsonl.1"); } catch { /* first rotation, or a locked file: start over */ }
+      this.logBytes = 0;
+    }
+    appendFileSync("data/events.jsonl", line);
+    this.logBytes += line.length;
   }
 }
 
